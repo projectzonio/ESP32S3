@@ -1,9 +1,20 @@
 //-----------1-----------
-// ESP32-S3 CAM Zonio Controller - TASK-BASED STREAM
-// Verze: 1.4.3-DEV-UNSTABLE - ESP32-S3 N16R8 with OV2640/OV5640 Camera
+// ESP32-S3 CAM Zonio Controller - DUAL-CORE STREAM
+// Verze: 1.4.6-FIX - ESP32-S3 N16R8 with OV2640/OV5640 Camera
 // Hardware: ESP32-S3-WROOM CAM (Freenove clone)
-// Changes: Rebuild blocking single loop to FreeRTOS task for non-blocking stream on Core 0. Single core solution caused massive memory leak.
-//          Memory leak partially fixed, unit dont brick itself after 1600s
+// FIX: Properly pinned FreeRTOS tasks for stable dual-core operation
+//
+// ===== ARDUINO IDE NASTAVENÍ =====
+// Board: "ESP32S3 Dev Module"
+// PSRAM: "OPI PSRAM"  <- KRITICKÉ!
+// Flash Mode: "QIO 80MHz"
+// Flash Size: "16MB (128Mb)"
+// Partition Scheme: "16M Flash (3MB APP/9.9MB FATFS)"
+// Core Debug Level: "None" (v produkci) / "Info" (debug)
+// USB CDC On Boot: "Disabled"
+// Events on core: "Core 1"  <- MQTT/WiFi na Core 1
+// Arduino Runs On: "Core 1"  <- loop() na Core 1
+// Upload Speed: "921600"
 //-----------------------
 
 #include <WiFi.h>
@@ -22,7 +33,7 @@
 #include "mbedtls/base64.h"
 
 // ===== FIRMWARE VERSION =====
-const char* FIRMWARE_VERSION = "1.4.3-TASK-S3-CAM";
+const char* FIRMWARE_VERSION = "1.4.6-DUAL-S3-CAM";
 const char* DEVICE_NAME_BASE = "ESP32S3-CAM-ZONIO";
 
 // ===== DEBUG FLAGS =====
@@ -90,7 +101,7 @@ int jpegQuality = 12;
 
 // ===== STREAM TASK CONTROL =====
 TaskHandle_t streamTaskHandle = NULL;
-SemaphoreHandle_t streamMutex = NULL;
+SemaphoreHandle_t frameMutex = NULL;
 volatile bool streamTaskRunning = false;
 volatile int activeStreamCount = 0;
 
@@ -217,38 +228,70 @@ bool initCamera() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_JPEG;
-  config.grab_mode = CAMERA_GRAB_LATEST;
   
-  Serial.println("   ESP32-S3 with PSRAM");
+  // ESP32-S3 kritické nastavení
+  config.xclk_freq_hz = 20000000;  // 20MHz pro stabilní běh
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.grab_mode = CAMERA_GRAB_LATEST;  // Vždy nejnovější snímek
+  
+  // PSRAM konfigurace pro ESP32-S3
+  Serial.printf("   PSRAM: %lu bytes available\n", (unsigned long)ESP.getPsramSize());
+  
   config.frame_size = (framesize_t)frameSize;
   config.jpeg_quality = jpegQuality;
-  config.fb_count = 2;
-  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.fb_count = 2;  // Double buffering pro plynulý stream
+  config.fb_location = CAMERA_FB_IN_PSRAM;  // Framebuffery v PSRAM
+  config.grab_mode = CAMERA_GRAB_LATEST;
 
+  // Inicializace kamery
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("❌ Camera init failed: 0x%x\n", err);
+    
+    // Diagnostika chyby
+    if (err == ESP_ERR_NOT_FOUND) {
+      Serial.println("   → Camera not detected on I2C bus");
+    } else if (err == ESP_ERR_NO_MEM) {
+      Serial.println("   → Insufficient memory (check PSRAM)");
+    }
     return false;
   }
 
+  // Získání senzoru a optimalizace pro stream
   sensor_t * s = esp_camera_sensor_get();
   if (s) {
     Serial.printf("   Sensor PID: 0x%02X\n", s->id.PID);
-    s->set_brightness(s, 0);
-    s->set_contrast(s, 0);
-    s->set_saturation(s, 0);
-    s->set_whitebal(s, 1);
-    s->set_awb_gain(s, 1);
-    s->set_exposure_ctrl(s, 1);
-    s->set_gain_ctrl(s, 1);
-    s->set_hmirror(s, 0);
-    s->set_vflip(s, 0);
+    
+    // Optimalizace pro streaming
+    s->set_brightness(s, 0);     // -2 až 2
+    s->set_contrast(s, 0);       // -2 až 2
+    s->set_saturation(s, 0);     // -2 až 2
+    s->set_whitebal(s, 1);       // AWB zapnuto
+    s->set_awb_gain(s, 1);       // Auto White Balance Gain
+    s->set_exposure_ctrl(s, 1);  // AEC zapnuto
+    s->set_aec2(s, 0);           // AEC DSP vypnuto (rychlejší)
+    s->set_ae_level(s, 0);       // -2 až 2
+    s->set_aec_value(s, 300);    // 0 až 1200
+    s->set_gain_ctrl(s, 1);      // AGC zapnuto
+    s->set_agc_gain(s, 0);       // 0 až 30
+    s->set_gainceiling(s, (gainceiling_t)0);  // 0 až 6
+    s->set_bpc(s, 0);            // Black pixel cancel
+    s->set_wpc(s, 1);            // White pixel cancel
+    s->set_raw_gma(s, 1);        // Gamma correction
+    s->set_lenc(s, 1);           // Lens correction
+    s->set_hmirror(s, 0);        // Horizontal mirror
+    s->set_vflip(s, 0);          // Vertical flip
+    s->set_dcw(s, 1);            // Downsize enable
+    s->set_colorbar(s, 0);       // Color bar test pattern
+    
+    // Kritické: Nastavení framerate pro plynulý stream
+    s->set_framesize(s, (framesize_t)frameSize);
+    s->set_quality(s, jpegQuality);
   }
 
   Serial.println("✅ Camera initialized");
   Serial.printf("   Resolution: %s, Quality: %d\n", getResolutionName().c_str(), jpegQuality);
+  Serial.printf("   FB Count: %d, Location: PSRAM\n", config.fb_count);
   
   return true;
 }
@@ -263,176 +306,247 @@ static const char* STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" P
 static const char* STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char* STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
+// Target FPS configuration
+#define TARGET_FPS 10
+#define FRAME_INTERVAL_MS (1000 / TARGET_FPS)  // 100ms for 10 FPS
+
 void streamTask(void *parameter) {
   WiFiClient* client = (WiFiClient*)parameter;
   
   if (!client || !client->connected()) {
     Serial.println("⚠️ Stream task: Invalid client");
+    if (client) delete client;
     vTaskDelete(NULL);
     return;
   }
 
-  activeStreamCount++;
+  // Zvýšení priority tasku pro plynulý stream
+  vTaskPrioritySet(NULL, configMAX_PRIORITIES - 2);
+
+  // Thread-safe increment
+  if (xSemaphoreTake(frameMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+    int count = activeStreamCount;
+    count++;
+    activeStreamCount = count;
+    xSemaphoreGive(frameMutex);
+  }
+  
   streamTaskRunning = true;
-  Serial.printf("📹 Stream task started on core %d (clients: %d)\n", xPortGetCoreID(), activeStreamCount);
+  Serial.printf("📹 Stream task started on CORE %d (priority %d, clients: %d)\n", 
+                xPortGetCoreID(), uxTaskPriorityGet(NULL), activeStreamCount);
 
   // Send HTTP headers
   client->println("HTTP/1.1 200 OK");
   client->printf("Content-Type: %s\r\n", STREAM_CONTENT_TYPE);
   client->println("Access-Control-Allow-Origin: *");
-  client->println("X-Framerate: 10");
+  client->printf("X-Framerate: %d\r\n", TARGET_FPS);
+  client->println("Cache-Control: no-cache, no-store, must-revalidate");
+  client->println("Pragma: no-cache");
+  client->println("Expires: 0");
   client->println();
 
   unsigned long lastFrameTime = millis();
   unsigned long streamStartTime = millis();
   int frameCount = 0;
+  int errorCount = 0;
+  const int MAX_ERRORS = 5;
   
   // Pre-allocate buffers
   char part_buf[64];
   const size_t chunkSize = 4096;
   
-  while (client->connected() && streamingEnabled) {
-    // Timeout check
-    if (!client->available() && (millis() - lastFrameTime > 10000)) {
-      Serial.println("⚠️ Stream timeout - no activity");
-      break;
+  // Timing stats
+  unsigned long totalCaptureTime = 0;
+  unsigned long totalSendTime = 0;
+  unsigned long maxCaptureTime = 0;
+  unsigned long maxSendTime = 0;
+  
+  // Streaming loop - běží na Core 0
+  while (client->connected() && errorCount < MAX_ERRORS) {
+    camera_fb_t *fb = NULL;
+    
+    // CRITICAL FIX: Přesný frame pacing
+    unsigned long now = millis();
+    unsigned long timeSinceLastFrame = now - lastFrameTime;
+    
+    // Pokud je čas menší než interval, počkej FIXNÍ zbývající čas
+    if (timeSinceLastFrame < FRAME_INTERVAL_MS) {
+      unsigned long waitTime = FRAME_INTERVAL_MS - timeSinceLastFrame;
+      vTaskDelay(pdMS_TO_TICKS(waitTime));
+      now = millis();  // Refresh času po delay
     }
-
-    camera_fb_t * fb = esp_camera_fb_get();
+    
+    // Získání framebufferu s timeoutem
+    unsigned long captureStart = millis();
+    fb = esp_camera_fb_get();
+    unsigned long captureTime = millis() - captureStart;
+    
     if (!fb) {
-      Serial.println("⚠️ Camera frame failed");
-      vTaskDelay(100 / portTICK_PERIOD_MS);
+      errorCount++;
+      Serial.printf("⚠️ Stream: Frame capture failed (%d/%d errors, took %lums)\n", 
+                    errorCount, MAX_ERRORS, captureTime);
+      vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
-
-    unsigned long writeStart = millis();
-    bool writeOk = true;
-
+    
+    // Reset error counter při úspěšném snímku
+    errorCount = 0;
+    
+    // Update capture stats
+    totalCaptureTime += captureTime;
+    if (captureTime > maxCaptureTime) maxCaptureTime = captureTime;
+    
     // Send boundary
-    if (client->write(STREAM_BOUNDARY, strlen(STREAM_BOUNDARY)) != strlen(STREAM_BOUNDARY)) {
-      writeOk = false;
+    unsigned long sendStart = millis();
+    size_t boundaryLen = strlen(STREAM_BOUNDARY);
+    if (client->write((const uint8_t*)STREAM_BOUNDARY, boundaryLen) != boundaryLen) {
+      esp_camera_fb_return(fb);
+      break;
     }
-
-    // Send JPEG header
-    if (writeOk) {
-      snprintf(part_buf, 64, STREAM_PART, fb->len);
-      if (client->write(part_buf, strlen(part_buf)) != strlen(part_buf)) {
-        writeOk = false;
-      }
+    
+    // Send content header
+    size_t hlen = snprintf(part_buf, sizeof(part_buf), STREAM_PART, fb->len);
+    if (client->write((const uint8_t*)part_buf, hlen) != hlen) {
+      esp_camera_fb_return(fb);
+      break;
     }
-
-    // Send JPEG data in chunks
-    if (writeOk) {
-      size_t remaining = fb->len;
-      size_t offset = 0;
+    
+    // Send image data in chunks
+    size_t bytesLeft = fb->len;
+    const uint8_t* ptr = fb->buf;
+    bool sendSuccess = true;
+    
+    while (bytesLeft > 0) {
+      size_t toSend = (bytesLeft > chunkSize) ? chunkSize : bytesLeft;
+      size_t sent = client->write(ptr, toSend);
       
-      while (remaining > 0 && writeOk) {
-        size_t toWrite = (remaining > chunkSize) ? chunkSize : remaining;
-        size_t written = client->write(fb->buf + offset, toWrite);
-        
-        if (written != toWrite) {
-          writeOk = false;
-          break;
-        }
-        
-        offset += written;
-        remaining -= written;
-        
-        // Timeout protection
-        if (millis() - writeStart > 2000) {
-          Serial.println("⚠️ Write timeout");
-          writeOk = false;
-          break;
-        }
-        
-        // Allow other tasks to run
+      if (sent != toSend) {
+        sendSuccess = false;
+        break;
+      }
+      
+      ptr += sent;
+      bytesLeft -= sent;
+      
+      // Yield každých 4KB pro responsivní systém
+      if (bytesLeft > 0) {
         taskYIELD();
       }
     }
-
+    
+    unsigned long sendTime = millis() - sendStart;
+    totalSendTime += sendTime;
+    if (sendTime > maxSendTime) maxSendTime = sendTime;
+    
     esp_camera_fb_return(fb);
-
-    if (!writeOk) {
-      Serial.println("❌ Stream write failed");
+    
+    if (!sendSuccess) {
+      Serial.println("⚠️ Stream: Send failed");
       break;
     }
-
-    lastFrameTime = millis();
+    
     frameCount++;
-
-    // Frame rate control (~10 FPS)
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+    lastFrameTime = millis();  // CRITICAL: Update času AFTER všech operací
+    
+    // FPS diagnostika každých 100 snímků
+    if (frameCount % 100 == 0) {
+      unsigned long elapsed = (millis() - streamStartTime) / 1000;
+      float actualFps = elapsed > 0 ? (float)frameCount / (float)elapsed : 0;
+      unsigned long avgCapture = frameCount > 0 ? totalCaptureTime / frameCount : 0;
+      unsigned long avgSend = frameCount > 0 ? totalSendTime / frameCount : 0;
+      
+      Serial.printf("📊 Stream stats @ %d frames:\n", frameCount);
+      Serial.printf("   FPS: %.1f (target: %d)\n", actualFps, TARGET_FPS);
+      Serial.printf("   Capture: avg=%lums, max=%lums\n", avgCapture, maxCaptureTime);
+      Serial.printf("   Send: avg=%lums, max=%lums\n", avgSend, maxSendTime);
+      Serial.printf("   Total time: %lus\n", elapsed);
+    }
+    
+    // Yield pro scheduler
+    taskYIELD();
   }
-
-  unsigned long duration = (millis() - streamStartTime) / 1000;
-  Serial.printf("📹 Stream ended: %d frames in %lu sec (%.1f fps)\n", 
-                frameCount, duration, duration > 0 ? (float)frameCount / duration : 0);
   
-  client->stop();
+  // Cleanup
   delete client;
   
-  activeStreamCount--;
+  // Thread-safe decrement
+  if (xSemaphoreTake(frameMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+    int count = activeStreamCount;
+    count--;
+    activeStreamCount = count;
+    xSemaphoreGive(frameMutex);
+  }
+  
   streamTaskRunning = false;
+  
+  unsigned long totalTime = (millis() - streamStartTime) / 1000;
+  float avgFps = totalTime > 0 ? (float)frameCount / (float)totalTime : 0;
+  
+  Serial.printf("📹 Stream ended: %d frames in %lus\n", frameCount, totalTime);
+  Serial.printf("   Average FPS: %.1f (target was %d)\n", avgFps, TARGET_FPS);
+  Serial.printf("   Clients remaining: %d\n", activeStreamCount);
   
   vTaskDelete(NULL);
 }
 
+// Handle stream requests - spouští task na Core 0
 void handleStreamRequest() {
   if (!streamingEnabled) {
     streamServer.send(503, "text/plain", "Streaming disabled");
     return;
   }
 
-  // Limit concurrent streams
-  if (activeStreamCount >= 2) {
-    streamServer.send(503, "text/plain", "Max clients reached");
-    Serial.println("⚠️ Stream rejected: max clients");
+  WiFiClient client = streamServer.client();
+  if (!client) {
+    Serial.println("⚠️ Invalid stream client");
     return;
   }
 
-  // Create new client on heap (will be deleted by task)
-  WiFiClient* client = new WiFiClient(streamServer.client());
+  // Alokace klienta v heapu pro předání do tasku
+  WiFiClient* clientPtr = new WiFiClient(client);
   
-  if (!client->connected()) {
-    Serial.println("⚠️ Client not connected");
-    delete client;
-    streamServer.send(500, "text/plain", "Connection failed");
-    return;
-  }
-
-  // Create stream task on Core 0 (loop runs on Core 1)
-  xTaskCreatePinnedToCore(
-    streamTask,           // Task function
-    "streamTask",         // Name
+  // Vytvoření stream tasku VŽDY na Core 0
+  BaseType_t result = xTaskCreatePinnedToCore(
+    streamTask,           // Funkce tasku
+    "StreamTask",         // Jméno
     8192,                 // Stack size (8KB)
-    (void*)client,        // Parameter (client pointer)
-    1,                    // Priority
-    &streamTaskHandle,    // Task handle
-    0                     // Core 0
+    (void*)clientPtr,     // Parametr
+    2,                    // Priorita (vyšší než loop)
+    &streamTaskHandle,    // Handle
+    0                     // CORE 0 - dedikované pro stream
   );
 
-  Serial.printf("📹 Stream task created (core 0)\n");
-}
-
-//-----------4-----------
-
-//-----------5-----------
-// ===== SNAPSHOT ENDPOINT =====
-
-void handleCapture() {
-  camera_fb_t * fb = esp_camera_fb_get();
-  if (!fb) {
-    streamServer.send(500, "text/plain", "Camera failed");
+  if (result != pdPASS) {
+    Serial.println("❌ Failed to create stream task");
+    delete clientPtr;
+    streamServer.send(503, "text/plain", "Task creation failed");
     return;
   }
+
+  // Nevracíme odpověď - task si řídí komunikaci sám
+  Serial.printf("✅ Stream task created on Core 0 (handle: %p)\n", streamTaskHandle);
+}
+
+// Handle single capture
+void handleCapture() {
+  camera_fb_t *fb = esp_camera_fb_get();
   
+  if (!fb) {
+    streamServer.send(503, "text/plain", "Camera capture failed");
+    return;
+  }
+
   streamServer.sendHeader("Content-Disposition", "inline; filename=capture.jpg");
-  streamServer.sendHeader("Access-Control-Allow-Origin", "*");
   streamServer.send_P(200, "image/jpeg", (const char *)fb->buf, fb->len);
   
   esp_camera_fb_return(fb);
 }
 
+//-----------4-----------
+
+
+//-----------5-----------
+// ===== Empty :/ ====
 //-----------5-----------
 
 //-----------6-----------
@@ -782,10 +896,14 @@ void setup() {
   delay(100);
   
   Serial.println("\n\n╔════════════════════════════════════════╗");
-  Serial.println("║   📷 ESP32-S3 CAM ZONIO v1.2          ║");
+  Serial.println("║   📷 ESP32-S3 CAM ZONIO v1.4.5        ║");
   Serial.println("╚════════════════════════════════════════╝");
   Serial.printf("   Firmware: %s\n", FIRMWARE_VERSION);
   Serial.printf("   PSRAM: %lu MB\n", ESP.getPsramSize() / 1024 / 1024);
+  Serial.printf("   Free PSRAM: %lu KB\n", ESP.getFreePsram() / 1024);
+  Serial.printf("   Free Heap: %lu KB\n", ESP.getFreeHeap() / 1024);
+  Serial.printf("   CPU Freq: %lu MHz\n", (unsigned long)ESP.getCpuFreqMHz());
+  Serial.printf("   Running on Core: %d\n", xPortGetCoreID());
   
   // Init pins
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
@@ -802,15 +920,25 @@ void setup() {
   mqttPrefix = "zonio/cam/" + deviceId;
   Serial.printf("   Device ID: %s\n", deviceId.c_str());
   
+  // KRITICKÉ: Vytvoření mutex PŘED inicializací kamery
+  frameMutex = xSemaphoreCreateMutex();
+  if (frameMutex == NULL) {
+    Serial.println("❌ Failed to create frame mutex!");
+    ESP.restart();
+  }
+  
   if (!initCamera()) {
-    Serial.println("❌ Camera failed!");
+    Serial.println("❌ Camera initialization failed!");
+    Serial.println("   Check PSRAM settings in Arduino IDE:");
+    Serial.println("   Board → ESP32S3 Dev Module");
+    Serial.println("   PSRAM → OPI PSRAM");
+    delay(5000);
+  } else {
+    Serial.println("✅ Camera ready for streaming");
   }
   
   loadSettings();
   initXorBuffer();
-  
-  // Create mutex for stream task coordination
-  streamMutex = xSemaphoreCreateMutex();
   
   if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
     Serial.println("🔧 BOOT button held on startup → AP Mode");
@@ -839,10 +967,11 @@ void setup() {
   
   startNonBlockingBlink(3);
   
-  Serial.println("\n✅ ESP32-S3 CAM READY");
+  Serial.println("\n✅ ESP32-S3 CAM READY - DUAL CORE MODE");
   Serial.printf("   Stream: http://%s:81/stream\n", WiFi.localIP().toString().c_str());
   Serial.printf("   Snapshot: http://%s:81/capture\n", WiFi.localIP().toString().c_str());
-  Serial.printf("   Loop running on Core: %d\n", xPortGetCoreID());
+  Serial.printf("   Main loop on Core: %d\n", xPortGetCoreID());
+  Serial.println("   Stream tasks will run on Core: 0");
   Serial.println("\n💡 Tip: Hold BOOT 5-15s for AP mode, >15s for factory reset");
 }
 
@@ -852,6 +981,9 @@ void loop() {
   static unsigned long totalMqttLoop = 0;
   static unsigned long timingCycles = 0;
   #endif
+  
+  // KRITICKÉ: loop() běží na Core 1, stream na Core 0
+  // Minimalizujeme blocking operace pro vysokou iteraci
   
   checkBootButton();
   
@@ -864,17 +996,16 @@ void loop() {
     return;
   }
   
-  // Handle stream server requests (just accepts connections, task does the work)
+  // Stream server - pouze přijímá requests, task řídí streaming
   streamServer.handleClient();
   
   processNonBlockingBlink();
-  yield();
   
   #if DEBUG_TIMING
   timingCycles++;
   #endif
   
-  // WiFi watchdog
+  // WiFi watchdog - throttled
   static unsigned long lastWiFiCheck = 0;
   if (millis() - lastWiFiCheck > 60000) {
     if (WiFi.status() != WL_CONNECTED) {
@@ -884,7 +1015,7 @@ void loop() {
     lastWiFiCheck = millis();
   }
   
-  // MQTT handling
+  // MQTT handling - optimalizováno
   #if DEBUG_TIMING
   unsigned long t4 = micros();
   #endif
@@ -896,7 +1027,7 @@ void loop() {
       lastReconnect = millis();
     }
   } else {
-    mqtt.loop();
+    mqtt.loop();  // Rychlé, non-blocking
   }
   
   #if DEBUG_TIMING
@@ -905,17 +1036,20 @@ void loop() {
   totalMqttLoop += mqttTime;
   #endif
   
-  // Heartbeat
+  // Heartbeat - throttled
   if (millis() - lastHeartbeat > 30000) {
     publishStatus();
     lastHeartbeat = millis();
   }
   
-  // Backend registration
+  // Backend registration - throttled
   if (millis() - lastRegistration > 300000) {
     registerWithBackend();
     lastRegistration = millis();
   }
+  
+  // Yield pro FreeRTOS scheduler - umožní Core 0 běžet
+  yield();
   
   // ===== DIAGNOSTICS =====
   #if DEBUG_DIAGNOSTICS
@@ -924,10 +1058,22 @@ void loop() {
   static uint32_t minPsram = 0xFFFFFFFF;
   static uint32_t loopCounter = 0;
   static unsigned long lastLoopCount = 0;
+  static uint32_t startupHeap = 0;
+  static uint32_t startupPsram = 0;
+  static bool firstDiag = true;
+  
   loopCounter++;
   
   uint32_t currentHeap = ESP.getFreeHeap();
   uint32_t currentPsram = ESP.getFreePsram();
+  
+  // Capture baseline on first run
+  if (firstDiag) {
+    startupHeap = currentHeap;
+    startupPsram = currentPsram;
+    firstDiag = false;
+  }
+  
   if (currentHeap < minHeap) minHeap = currentHeap;
   if (currentPsram < minPsram) minPsram = currentPsram;
   
@@ -935,19 +1081,27 @@ void loop() {
     unsigned long uptime = millis() / 1000;
     uint32_t loopsPerSec = (loopCounter - lastLoopCount) / (DIAG_INTERVAL_MS / 1000);
     
+    // Memory leak detection
+    int32_t heapDelta = (int32_t)currentHeap - (int32_t)startupHeap;
+    int32_t psramDelta = (int32_t)currentPsram - (int32_t)startupPsram;
+    
     Serial.println("\n╔══════════════════════════════════════════════════════╗");
     Serial.printf("║ 🔍 DIAG @ %lu s uptime                              ║\n", uptime);
     Serial.println("╠══════════════════════════════════════════════════════╣");
     Serial.printf("║ HEAP:     %3lu KB free (min: %3lu KB)                 ║\n", 
         (unsigned long)(currentHeap / 1024), (unsigned long)(minHeap / 1024));
+    Serial.printf("║   Delta from start: %s%ld KB                          ║\n",
+        heapDelta >= 0 ? "+" : "", (long)(heapDelta / 1024));
     Serial.printf("║ PSRAM:   %4lu KB free (min: %4lu KB)                  ║\n", 
         (unsigned long)(currentPsram / 1024), (unsigned long)(minPsram / 1024));
+    Serial.printf("║   Delta from start: %s%ld KB                          ║\n",
+        psramDelta >= 0 ? "+" : "", (long)(psramDelta / 1024));
     Serial.println("╠══════════════════════════════════════════════════════╣");
     Serial.printf("║ WiFi:  RSSI=%d dBm, Status=%d                        ║\n", 
         WiFi.RSSI(), WiFi.status());
     Serial.printf("║ MQTT:  connected=%d, state=%d                        ║\n", 
         mqtt.connected(), mqtt.state());
-    Serial.printf("║ Stream tasks: %d active                              ║\n", 
+    Serial.printf("║ Stream tasks: %d active on Core 0                    ║\n", 
         activeStreamCount);
     Serial.printf("║ Loop:  %lu iter/s (Core %d)                          ║\n", 
         (unsigned long)loopsPerSec, xPortGetCoreID());
@@ -965,11 +1119,27 @@ void loop() {
     
     Serial.println("╚══════════════════════════════════════════════════════╝");
     
+    // Warnings s memory leak detection
     if (currentHeap < 50000) {
       Serial.println("⚠️ WARNING: HEAP CRITICALLY LOW!");
     }
-    if (loopsPerSec < 1000 && activeStreamCount == 0) {
-      Serial.println("⚠️ WARNING: LOOP RATE SLOW WITHOUT ACTIVE STREAMS!");
+    if (currentPsram < 1000000) {
+      Serial.println("⚠️ WARNING: PSRAM CRITICALLY LOW!");
+    }
+    if (heapDelta < -50000) {
+      Serial.printf("🔴 MEMORY LEAK DETECTED: HEAP lost %ld KB since startup!\n", 
+                    (long)(-heapDelta / 1024));
+    }
+    if (psramDelta < -1000000) {
+      Serial.printf("🔴 MEMORY LEAK DETECTED: PSRAM lost %ld KB since startup!\n", 
+                    (long)(-psramDelta / 1024));
+    }
+    if (loopsPerSec < 5000 && activeStreamCount == 0) {
+      Serial.println("⚠️ WARNING: LOOP RATE VERY SLOW WITHOUT STREAMS!");
+      Serial.println("   Expected: >10000 iter/s on idle Core 1");
+    }
+    if (loopsPerSec > 20000) {
+      Serial.printf("✅ EXCELLENT: Loop running at %lu iter/s\n", (unsigned long)loopsPerSec);
     }
     
     lastDiag = millis();
