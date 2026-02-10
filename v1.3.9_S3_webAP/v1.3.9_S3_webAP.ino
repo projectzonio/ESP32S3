@@ -1,8 +1,9 @@
 //-----------1-----------
-// ESP32-S3 CAM Zonio Controller v1.1
-// Verze: 1.3.9-S3-CAM - ESP32-S3 N16R8 with OV2640/OV5640 Camera
+// ESP32-S3 CAM Zonio Controller - TASK-BASED STREAM
+// Verze: 1.4.3-DEV-UNSTABLE - ESP32-S3 N16R8 with OV2640/OV5640 Camera
 // Hardware: ESP32-S3-WROOM CAM (Freenove clone)
-// Developed with Claude Opus 4.5 (Thinking)
+// Changes: Rebuild blocking single loop to FreeRTOS task for non-blocking stream on Core 0. Single core solution caused massive memory leak.
+//          Memory leak partially fixed, unit dont brick itself after 1600s
 //-----------------------
 
 #include <WiFi.h>
@@ -18,19 +19,24 @@
 #include "esp_timer.h"
 #include "img_converters.h"
 #include "fb_gfx.h"
-#include "mbedtls/base64.h"  // For SSE Photo Stream encoding
+#include "mbedtls/base64.h"
 
 // ===== FIRMWARE VERSION =====
-const char* FIRMWARE_VERSION = "1.3.9-S3-CAM-ZONIO";
+const char* FIRMWARE_VERSION = "1.4.3-TASK-S3-CAM";
 const char* DEVICE_NAME_BASE = "ESP32S3-CAM-ZONIO";
 
-// ===== XOR ENCRYPTION KEY - MUST MATCH BACKEND! =====
+// ===== DEBUG FLAGS =====
+#define DEBUG_DIAGNOSTICS 1
+#define DEBUG_TIMING 1
+#define DIAG_INTERVAL_MS 10000
+
+// ===== XOR ENCRYPTION KEY =====
 const char* XOR_KEY = "MojeTajneHeslo1234567890";
 
-// ===== BOOT BUTTON (pro AP mode a factory reset) =====
-#define BOOT_BUTTON_PIN 0  // GPIO 0 = BOOT button na většině ESP32-S3
+// ===== BOOT BUTTON =====
+#define BOOT_BUTTON_PIN 0
 
-// ===== ESP32-S3-WROOM CAM PIN MAP (Freenove/Generic) =====
+// ===== ESP32-S3-WROOM CAM PIN MAP =====
 #define PWDN_GPIO_NUM    -1
 #define RESET_GPIO_NUM   -1
 #define XCLK_GPIO_NUM    15
@@ -49,8 +55,8 @@ const char* XOR_KEY = "MojeTajneHeslo1234567890";
 #define PCLK_GPIO_NUM    13
 
 // ===== LED PINS =====
-#define LED_GPIO_NUM     48   // Onboard LED (pokud existuje)
-#define FLASH_LED_PIN    2    // External flash LED
+#define LED_GPIO_NUM     48
+#define FLASH_LED_PIN    2
 
 // ===== GLOBAL OBJECTS =====
 WebServer server(80);
@@ -69,7 +75,7 @@ bool flashEnabled = false;
 unsigned long lastHeartbeat = 0;
 unsigned long lastRegistration = 0;
 
-// ===== CONFIGURATION VARS (Loaded from NVS) =====
+// ===== CONFIGURATION VARS =====
 String wifi_ssid = "";
 String wifi_pass = "";
 String mqtt_server = "";
@@ -81,6 +87,12 @@ String backend_url = "";
 // Camera settings
 int frameSize = FRAMESIZE_VGA;
 int jpegQuality = 12;
+
+// ===== STREAM TASK CONTROL =====
+TaskHandle_t streamTaskHandle = NULL;
+SemaphoreHandle_t streamMutex = NULL;
+volatile bool streamTaskRunning = false;
+volatile int activeStreamCount = 0;
 
 //-----------1-----------
 
@@ -99,7 +111,7 @@ void setLed(bool state) {
   #endif
 }
 
-// NON-BLOCKING BLINK - state machine
+// NON-BLOCKING BLINK
 int blinkCount = 0;
 int blinkTarget = 0;
 unsigned long blinkTimer = 0;
@@ -123,14 +135,13 @@ void processNonBlockingBlink() {
   }
 }
 
-// ===== XOR ENCRYPTION HELPERS =====
-// Static buffers in PSRAM - NO HEAP FRAGMENTATION
+// ===== XOR ENCRYPTION =====
 static uint8_t* xorBuffer = nullptr;
 static const int XOR_BUFFER_SIZE = 512;
-static uint8_t mqttDecryptBuffer[256];  // Static decrypt buffer
+static uint8_t mqttDecryptBuffer[256];
 
 void initXorBuffer() {
-  xorBuffer = (uint8_t*)ps_malloc(XOR_BUFFER_SIZE);  // Allocate once in PSRAM
+  xorBuffer = (uint8_t*)ps_malloc(XOR_BUFFER_SIZE);
 }
 
 void xorPayload(uint8_t* buffer, int len) {
@@ -140,7 +151,6 @@ void xorPayload(uint8_t* buffer, int len) {
   }
 }
 
-// BURST SHOT: Static buffer, no malloc
 void publishEncrypted(const String& topic, const String& payload) {
   if (!mqtt.connected() || !xorBuffer) return;
 
@@ -173,7 +183,6 @@ String getResolutionName() {
   }
 }
 
-// ===== FACTORY RESET =====
 void wipeNVS() {
   preferences.begin("cam-config", false);
   preferences.clear();
@@ -212,11 +221,10 @@ bool initCamera() {
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode = CAMERA_GRAB_LATEST;
   
-  // ESP32-S3 N16R8 má 8MB PSRAM
   Serial.println("   ESP32-S3 with PSRAM");
   config.frame_size = (framesize_t)frameSize;
   config.jpeg_quality = jpegQuality;
-  config.fb_count = 1;  // SINGLE BUFFER = always latest frame, no stale data
+  config.fb_count = 2;
   config.fb_location = CAMERA_FB_IN_PSRAM;
 
   esp_err_t err = esp_camera_init(&config);
@@ -248,399 +256,288 @@ bool initCamera() {
 //-----------3-----------
 
 //-----------4-----------
-// ===== MJPEG STREAMING =====
-
-// Flush camera buffer - discard stale frames
-void flushCameraBuffer() {
-  camera_fb_t * fb;
-  for (int i = 0; i < 3; i++) {
-    fb = esp_camera_fb_get();
-    if (fb) esp_camera_fb_return(fb);
-  }
-}
+// ===== STREAM TASK (RUNS ON CORE 0) =====
 
 #define PART_BOUNDARY "123456789000000000000987654321"
 static const char* STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
 static const char* STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char* STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
-void handleStream() {
-  if (!streamingEnabled) {
-    streamServer.send(503, "text/plain", "Streaming disabled");
+void streamTask(void *parameter) {
+  WiFiClient* client = (WiFiClient*)parameter;
+  
+  if (!client || !client->connected()) {
+    Serial.println("⚠️ Stream task: Invalid client");
+    vTaskDelete(NULL);
     return;
   }
 
-  WiFiClient client = streamServer.client();
-  client.setNoDelay(true);  // Disable Nagle - immediate send
-  client.setTimeout(2000);  // 2s timeout to prevent blocking on network stall
+  activeStreamCount++;
+  streamTaskRunning = true;
+  Serial.printf("📹 Stream task started on core %d (clients: %d)\n", xPortGetCoreID(), activeStreamCount);
+
+  // Send HTTP headers
+  client->println("HTTP/1.1 200 OK");
+  client->printf("Content-Type: %s\r\n", STREAM_CONTENT_TYPE);
+  client->println("Access-Control-Allow-Origin: *");
+  client->println("X-Framerate: 10");
+  client->println();
+
+  unsigned long lastFrameTime = millis();
+  unsigned long streamStartTime = millis();
+  int frameCount = 0;
   
-  Serial.println("▶️ MJPEG Stream started");
-
-  client.println("HTTP/1.1 200 OK");
-  client.print("Content-Type: ");
-  client.println(STREAM_CONTENT_TYPE);
-  client.println("Access-Control-Allow-Origin: *");
-  client.println("Connection: close");
-  client.println();
-
-  // FLUSH: Discard any stale frames before streaming
-  flushCameraBuffer();
-
-  unsigned long lastMqttLoop = 0;
-  unsigned long lastFrame = 0;
-  unsigned long streamStart = millis();
-  unsigned long framesSent = 0;
-  const unsigned long FRAME_INTERVAL = 50;
-  const unsigned long STREAM_TIMEOUT = 300000;  // 5 min max - thermal protection
-
-  while (client.connected()) {
-    unsigned long now = millis();
-    
-    // Timeout protection - prevents thermal damage
-    if (now - streamStart > STREAM_TIMEOUT) {
-      Serial.println("🛑 Stream timeout (5 min)");
+  // Pre-allocate buffers
+  char part_buf[64];
+  const size_t chunkSize = 4096;
+  
+  while (client->connected() && streamingEnabled) {
+    // Timeout check
+    if (!client->available() && (millis() - lastFrameTime > 10000)) {
+      Serial.println("⚠️ Stream timeout - no activity");
       break;
     }
-    
-    // Frame rate limiting
-    if (now - lastFrame < FRAME_INTERVAL) {
-      yield();
-      continue;
-    }
-    
+
     camera_fb_t * fb = esp_camera_fb_get();
     if (!fb) {
-      Serial.println("❌ Camera capture failed");
-      break;
+      Serial.println("⚠️ Camera frame failed");
+      vTaskDelay(100 / portTICK_PERIOD_MS);
+      continue;
     }
 
-    client.print(STREAM_BOUNDARY);
-    char partBuf[64];
-    snprintf(partBuf, 64, STREAM_PART, fb->len);
-    client.print(partBuf);
-    
-    // Write frame data - if this fails/times out, loop breaks
-    if (client.write(fb->buf, fb->len) == 0) {
-      Serial.println("❌ Stream write failed (client disconnected?)");
-      esp_camera_fb_return(fb);
-      break;
-    }
-    
-    esp_camera_fb_return(fb);
-    lastFrame = now;
-    framesSent++;
+    unsigned long writeStart = millis();
+    bool writeOk = true;
 
-    // Periodic Health Check (every 20 frames ~ 1 sec)
-    if (framesSent % 20 == 0) {
-        Serial.printf("📊 MJPEG health: frames=%lu, heap=%u, psram=%u\n", 
-          framesSent, ESP.getFreeHeap(), ESP.getFreePsram());
+    // Send boundary
+    if (client->write(STREAM_BOUNDARY, strlen(STREAM_BOUNDARY)) != strlen(STREAM_BOUNDARY)) {
+      writeOk = false;
+    }
+
+    // Send JPEG header
+    if (writeOk) {
+      snprintf(part_buf, 64, STREAM_PART, fb->len);
+      if (client->write(part_buf, strlen(part_buf)) != strlen(part_buf)) {
+        writeOk = false;
+      }
+    }
+
+    // Send JPEG data in chunks
+    if (writeOk) {
+      size_t remaining = fb->len;
+      size_t offset = 0;
+      
+      while (remaining > 0 && writeOk) {
+        size_t toWrite = (remaining > chunkSize) ? chunkSize : remaining;
+        size_t written = client->write(fb->buf + offset, toWrite);
         
-        // Blink LED briefly to show activity
-        setLed(true);
-        delay(1);
-        setLed(false);
+        if (written != toWrite) {
+          writeOk = false;
+          break;
+        }
+        
+        offset += written;
+        remaining -= written;
+        
+        // Timeout protection
+        if (millis() - writeStart > 2000) {
+          Serial.println("⚠️ Write timeout");
+          writeOk = false;
+          break;
+        }
+        
+        // Allow other tasks to run
+        taskYIELD();
+      }
     }
-    
-    yield();
-    if (now - lastMqttLoop > 500) {
-      if (mqtt.connected()) mqtt.loop();
-      lastMqttLoop = now;
+
+    esp_camera_fb_return(fb);
+
+    if (!writeOk) {
+      Serial.println("❌ Stream write failed");
+      break;
     }
+
+    lastFrameTime = millis();
+    frameCount++;
+
+    // Frame rate control (~10 FPS)
+    vTaskDelay(100 / portTICK_PERIOD_MS);
   }
+
+  unsigned long duration = (millis() - streamStartTime) / 1000;
+  Serial.printf("📹 Stream ended: %d frames in %lu sec (%.1f fps)\n", 
+                frameCount, duration, duration > 0 ? (float)frameCount / duration : 0);
   
-  // CLEANUP: Close client only - DON'T disconnect MQTT!
-  client.stop();
-  Serial.println("⏹️ MJPEG Stream ended");
+  client->stop();
+  delete client;
+  
+  activeStreamCount--;
+  streamTaskRunning = false;
+  
+  vTaskDelete(NULL);
 }
 
-// ===== SSE PHOTO STREAM (3 FPS) =====
-// Non-blocking alternative to MJPEG - sends base64 JPEG via Server-Sent Events
-void handlePhotoStream() {
+void handleStreamRequest() {
   if (!streamingEnabled) {
     streamServer.send(503, "text/plain", "Streaming disabled");
     return;
   }
 
-  WiFiClient client = streamServer.client();
-  client.setNoDelay(true);
-  client.setTimeout(2000); // 2s timeout
-  
-  Serial.println("▶️ SSE Stream started");
-
-  // SSE Headers
-  client.println("HTTP/1.1 200 OK");
-  client.println("Content-Type: text/event-stream");
-  client.println("Cache-Control: no-cache");
-  client.println("Access-Control-Allow-Origin: *");
-  client.println("Connection: keep-alive");
-  client.println();
-
-  // Flush stale frames
-  flushCameraBuffer();
-
-  unsigned long lastFrame = 0;
-  unsigned long lastMqttLoop = 0;
-  unsigned long streamStart = millis();
-  unsigned long framesSent = 0;
-  const unsigned long FRAME_INTERVAL = 333;  // ~3 FPS
-  const unsigned long STREAM_TIMEOUT = 300000;  // 5 min max
-
-  // Static buffer for base64 encoding (in PSRAM)
-  static char* base64Buffer = nullptr;
-  static const size_t BASE64_BUFFER_SIZE = 150000;  // ~100KB JPEG -> ~133KB base64
-  
-  if (!base64Buffer) {
-    base64Buffer = (char*)ps_malloc(BASE64_BUFFER_SIZE);
-    if (!base64Buffer) {
-      client.println("event: error");
-      client.println("data: {\"error\":\"Memory allocation failed\"}");
-      client.println();
-      client.stop();
-      return;
-    }
-  }
-
-  while (client.connected()) {
-    unsigned long now = millis();
-    
-    // Timeout protection
-    if (now - streamStart > STREAM_TIMEOUT) {
-      client.println("event: timeout");
-      client.println("data: {\"reason\":\"Stream timeout (5 min max)\"}");
-      client.println();
-      break;
-    }
-    
-    // Frame rate limiting - 3 FPS
-    if (now - lastFrame < FRAME_INTERVAL) {
-      yield();
-      // Keep MQTT alive during wait
-      if (now - lastMqttLoop > 100) {
-        if (mqtt.connected()) mqtt.loop();
-        lastMqttLoop = now;
-      }
-      continue;
-    }
-    
-    camera_fb_t* fb = esp_camera_fb_get();
-    if (!fb) {
-      client.println("event: error");
-      client.println("data: {\"error\":\"Capture failed\"}");
-      client.println();
-      break;
-    }
-
-    // Check if image fits in buffer
-    size_t base64Len = ((fb->len + 2) / 3) * 4 + 1;
-    if (base64Len > BASE64_BUFFER_SIZE) {
-      esp_camera_fb_return(fb);
-      client.println("event: error");
-      client.println("data: {\"error\":\"Image too large\"}");
-      client.println();
-      break;
-    }
-
-    // Encode to base64
-    size_t outLen = 0;
-    mbedtls_base64_encode((unsigned char*)base64Buffer, BASE64_BUFFER_SIZE, 
-                          &outLen, fb->buf, fb->len);
-    base64Buffer[outLen] = '\0';
-    
-    esp_camera_fb_return(fb);
-
-    // Send SSE event with data URL
-    client.println("event: frame");
-    client.print("data: data:image/jpeg;base64,");
-    client.println(base64Buffer);
-    client.println();
-    
-    lastFrame = now;
-    framesSent++;
-
-    if (framesSent % 5 == 0) { // Log every 5 frames (approx 1.5s)
-        Serial.printf("📊 SSE health: frames=%lu, heap=%u\n", framesSent, ESP.getFreeHeap());
-    }
-
-    yield();
-  }
-  
-  client.stop();
-  Serial.println("⏹️ SSE Stream ended");
-}
-
-void handleCapture() {
-  camera_fb_t * fb = esp_camera_fb_get();
-  if (!fb) {
-    streamServer.send(500, "text/plain", "Capture failed");
+  // Limit concurrent streams
+  if (activeStreamCount >= 2) {
+    streamServer.send(503, "text/plain", "Max clients reached");
+    Serial.println("⚠️ Stream rejected: max clients");
     return;
   }
 
-  Serial.printf("📸 Snapshot: %u bytes\n", fb->len);
-  streamServer.sendHeader("Content-Type", "image/jpeg");
-  streamServer.sendHeader("Access-Control-Allow-Origin", "*");
-  streamServer.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
-  esp_camera_fb_return(fb);
-}
-
-void handleControl() {
-  String cmd = streamServer.arg("cmd");
-  String response = "{\"success\":true}";
-
-  if (cmd == "flash_on") { setFlash(true); flashEnabled = true; }
-  else if (cmd == "flash_off") { setFlash(false); flashEnabled = false; }
-  else if (cmd == "stream_on") { streamingEnabled = true; }
-  else if (cmd == "stream_off") { streamingEnabled = false; }
-  else if (cmd == "resolution") {
-    String size = streamServer.arg("size");
-    sensor_t * s = esp_camera_sensor_get();
-    if (s) {
-      if (size == "QVGA") s->set_framesize(s, FRAMESIZE_QVGA);
-      else if (size == "VGA") s->set_framesize(s, FRAMESIZE_VGA);
-      else if (size == "SVGA") s->set_framesize(s, FRAMESIZE_SVGA);
-      else if (size == "XGA") s->set_framesize(s, FRAMESIZE_XGA);
-    }
-  } else {
-    response = "{\"success\":false,\"error\":\"Unknown command\"}";
+  // Create new client on heap (will be deleted by task)
+  WiFiClient* client = new WiFiClient(streamServer.client());
+  
+  if (!client->connected()) {
+    Serial.println("⚠️ Client not connected");
+    delete client;
+    streamServer.send(500, "text/plain", "Connection failed");
+    return;
   }
 
-  streamServer.sendHeader("Access-Control-Allow-Origin", "*");
-  streamServer.send(200, "application/json", response);
-}
+  // Create stream task on Core 0 (loop runs on Core 1)
+  xTaskCreatePinnedToCore(
+    streamTask,           // Task function
+    "streamTask",         // Name
+    8192,                 // Stack size (8KB)
+    (void*)client,        // Parameter (client pointer)
+    1,                    // Priority
+    &streamTaskHandle,    // Task handle
+    0                     // Core 0
+  );
 
-void handleInfo() {
-  JsonDocument doc;
-  doc["device"] = deviceId;
-  doc["firmware"] = FIRMWARE_VERSION;
-  doc["chip"] = "ESP32-S3";
-  doc["psram"] = ESP.getFreePsram();
-  doc["ip"] = WiFi.localIP().toString();
-  doc["streaming"] = streamingEnabled;
-  doc["resolution"] = getResolutionName();
-  
-  String response;
-  serializeJson(doc, response);
-  streamServer.sendHeader("Access-Control-Allow-Origin", "*");
-  streamServer.send(200, "application/json", response);
-}
-
-void setupStreamServer() {
-  streamServer.on("/stream", HTTP_GET, handleStream);       // Legacy MJPEG (blocking)
-  streamServer.on("/photostream", HTTP_GET, handlePhotoStream);  // NEW: SSE 3 FPS
-  streamServer.on("/capture", HTTP_GET, handleCapture);     // Single snapshot
-  streamServer.on("/control", HTTP_GET, handleControl);
-  streamServer.on("/info", HTTP_GET, handleInfo);
-  streamServer.begin();
-  Serial.println("🎥 Stream server on :81");
-  Serial.println("   /photostream = SSE 3 FPS (recommended)");
-  Serial.println("   /stream = MJPEG (legacy)");
+  Serial.printf("📹 Stream task created (core 0)\n");
 }
 
 //-----------4-----------
 
 //-----------5-----------
-// ===== MQTT CONTROL =====
+// ===== SNAPSHOT ENDPOINT =====
 
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  // Use static buffer - no malloc
-  if (length >= sizeof(mqttDecryptBuffer)) return;
-  
-  memcpy(mqttDecryptBuffer, payload, length);
-  xorPayload(mqttDecryptBuffer, length);
-  mqttDecryptBuffer[length] = '\0';
-
-  char* message = (char*)mqttDecryptBuffer;  // Direct pointer, no String
-
-  JsonDocument doc;
-  if (!deserializeJson(doc, message)) {
-    const char* cmd = doc["cmd"] | "";
-    
-    if (strcmp(cmd, "snapshot") == 0) { publishEncrypted(mqttPrefix + "/snapshot/notify", "{\"ready\":true}"); }
-    else if (strcmp(cmd, "stream_on") == 0) { streamingEnabled = true; publishStatus(); }
-    else if (strcmp(cmd, "stream_off") == 0) { streamingEnabled = false; publishStatus(); }
-    else if (strcmp(cmd, "flash_on") == 0) { setFlash(true); flashEnabled = true; }
-    else if (strcmp(cmd, "flash_off") == 0) { setFlash(false); flashEnabled = false; }
-    else if (strcmp(cmd, "restart") == 0) { ESP.restart(); }
-    else if (strcmp(cmd, "status") == 0) { publishStatus(); }
-    else if (strcmp(cmd, "resolution") == 0) {
-      const char* size = doc["size"] | "VGA";
-      sensor_t * s = esp_camera_sensor_get();
-      if (s) {
-        if (strcmp(size, "QVGA") == 0) { s->set_framesize(s, FRAMESIZE_QVGA); frameSize = FRAMESIZE_QVGA; }
-        else if (strcmp(size, "VGA") == 0) { s->set_framesize(s, FRAMESIZE_VGA); frameSize = FRAMESIZE_VGA; }
-        else if (strcmp(size, "SVGA") == 0) { s->set_framesize(s, FRAMESIZE_SVGA); frameSize = FRAMESIZE_SVGA; }
-        publishStatus();
-      }
-    }
+void handleCapture() {
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) {
+    streamServer.send(500, "text/plain", "Camera failed");
+    return;
   }
-}
-
-void publishStatus() {
-  JsonDocument doc;
-  doc["online"] = true;
-  doc["ip"] = WiFi.localIP().toString();
-  doc["streaming"] = streamingEnabled;
-  doc["resolution"] = getResolutionName();
-  doc["flash"] = flashEnabled;
-  doc["rssi"] = WiFi.RSSI();
-  doc["version"] = FIRMWARE_VERSION;
-  doc["uptime"] = millis() / 1000;
-  doc["chip"] = "ESP32-S3";
-  doc["heap"] = ESP.getFreeHeap() / 1024;    // KB free - MEMORY MONITOR
-  doc["psram"] = ESP.getFreePsram() / 1024;  // KB free - MEMORY MONITOR
-
-  char buffer[512];
-  serializeJson(doc, buffer);
-  publishEncrypted(mqttPrefix + "/status", buffer);
-}
-
-void setupMQTT() {
-  mqtt.setServer(mqtt_server.c_str(), mqtt_port);
-  mqtt.setCallback(mqttCallback);
-  mqtt.setBufferSize(512);
-}
-
-bool connectMQTT() {
-  if (mqtt.connected()) return true;
-
-  String clientId = deviceId + "-" + String(millis() & 0xFFFF);
-  Serial.print("🔌 MQTT... ");
   
-  bool connected = mqtt_user.length() > 0 
-    ? mqtt.connect(clientId.c_str(), mqtt_user.c_str(), mqtt_pass.c_str())
-    : mqtt.connect(clientId.c_str());
-
-  if (connected) {
-    Serial.println("OK");
-    String controlTopic = mqttPrefix + "/control";
-    mqtt.subscribe(controlTopic.c_str());
-    publishStatus();
-    return true;
-  }
-  Serial.printf("FAIL (rc=%d)\n", mqtt.state());
-  return false;
+  streamServer.sendHeader("Content-Disposition", "inline; filename=capture.jpg");
+  streamServer.sendHeader("Access-Control-Allow-Origin", "*");
+  streamServer.send_P(200, "image/jpeg", (const char *)fb->buf, fb->len);
+  
+  esp_camera_fb_return(fb);
 }
 
 //-----------5-----------
 
 //-----------6-----------
-// ===== NVS CONFIGURATION =====
+// ===== BOOT BUTTON HANDLER =====
 
-void loadSettings() {
-  Serial.println("\n📂 Loading NVS settings...");
+unsigned long bootButtonPressStart = 0;
+bool bootButtonPressed = false;
+
+void checkBootButton() {
+  bool currentState = (digitalRead(BOOT_BUTTON_PIN) == LOW);
   
-  preferences.begin("cam-config", false);
-  wifi_ssid = preferences.getString("wifi_ssid", "");
-  wifi_pass = preferences.getString("wifi_pass", "");
-  mqtt_server = preferences.getString("mqtt_server", "");
-  mqtt_port = preferences.getInt("mqtt_port", 1883);
-  mqtt_user = preferences.getString("mqtt_user", "");
-  mqtt_pass = preferences.getString("mqtt_pass", "");
-  backend_url = preferences.getString("backend_url", "");
-  frameSize = preferences.getInt("frame_size", FRAMESIZE_VGA);
-  jpegQuality = preferences.getInt("jpeg_quality", 12);
-  preferences.end();
+  if (currentState && !bootButtonPressed) {
+    bootButtonPressStart = millis();
+    bootButtonPressed = true;
+    Serial.println("🔘 BOOT button pressed");
+  }
   
-  Serial.printf("   WiFi: %s, MQTT: %s:%d\n", wifi_ssid.c_str(), mqtt_server.c_str(), mqtt_port);
+  if (!currentState && bootButtonPressed) {
+    unsigned long pressDuration = millis() - bootButtonPressStart;
+    bootButtonPressed = false;
+    
+    if (pressDuration > 15000) {
+      Serial.println("🔥 FACTORY RESET (15s hold)");
+      startNonBlockingBlink(10);
+      delay(1000);
+      wipeNVS();
+    } else if (pressDuration > 5000) {
+      Serial.println("🔧 Entering AP Mode (5s hold)");
+      startNonBlockingBlink(5);
+      delay(500);
+      ESP.restart();
+    }
+  }
+}
+
+//-----------6-----------
+
+//-----------7-----------
+// ===== CONFIGURATION WEB PORTAL =====
+
+void startAPMode() {
+  apMode = true;
+  
+  String apName = String(DEVICE_NAME_BASE) + "-" + deviceId;
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(apName.c_str());
+  
+  IPAddress IP = WiFi.softAPIP();
+  Serial.printf("\n📡 AP Mode Started\n");
+  Serial.printf("   SSID: %s\n", apName.c_str());
+  Serial.printf("   IP: %s\n", IP.toString().c_str());
+  
+  dnsServer.start(53, "*", IP);
+  
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/config", HTTP_POST, handleConfig);
+  server.onNotFound(handleRoot);
+  server.begin();
+  
+  Serial.println("   Config portal: http://192.168.4.1");
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<style>body{font-family:Arial;margin:20px;background:#f0f0f0}";
+  html += ".container{max-width:500px;margin:auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}";
+  html += "h1{color:#333;text-align:center}input,button{width:100%;padding:10px;margin:8px 0;box-sizing:border-box;border:1px solid #ddd;border-radius:4px}";
+  html += "button{background:#007bff;color:white;border:none;cursor:pointer;font-size:16px}button:hover{background:#0056b3}";
+  html += ".info{background:#e7f3ff;padding:10px;border-radius:4px;margin:10px 0;font-size:14px}</style></head><body>";
+  html += "<div class='container'><h1>📷 ESP32-S3 CAM</h1>";
+  html += "<div class='info'>Device ID: <b>" + deviceId + "</b><br>Version: " + String(FIRMWARE_VERSION) + "</div>";
+  html += "<form action='/config' method='POST'>";
+  html += "<input name='wifi_ssid' placeholder='WiFi SSID' value='" + wifi_ssid + "' required>";
+  html += "<input name='wifi_pass' type='password' placeholder='WiFi Password' value='" + wifi_pass + "'>";
+  html += "<input name='mqtt_server' placeholder='MQTT Server' value='" + mqtt_server + "' required>";
+  html += "<input name='mqtt_port' placeholder='MQTT Port' value='" + String(mqtt_port) + "' required>";
+  html += "<input name='mqtt_user' placeholder='MQTT Username' value='" + mqtt_user + "'>";
+  html += "<input name='mqtt_pass' type='password' placeholder='MQTT Password' value='" + mqtt_pass + "'>";
+  html += "<input name='backend_url' placeholder='Backend URL (optional)' value='" + backend_url + "'>";
+  html += "<button type='submit'>💾 Save & Restart</button></form></div></body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleConfig() {
+  wifi_ssid = server.arg("wifi_ssid");
+  wifi_pass = server.arg("wifi_pass");
+  mqtt_server = server.arg("mqtt_server");
+  mqtt_port = server.arg("mqtt_port").toInt();
+  mqtt_user = server.arg("mqtt_user");
+  mqtt_pass = server.arg("mqtt_pass");
+  backend_url = server.arg("backend_url");
+  
+  saveSettings();
+  
+  String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<style>body{font-family:Arial;text-align:center;padding:50px;background:#f0f0f0}";
+  html += ".success{background:white;padding:30px;border-radius:8px;display:inline-block;box-shadow:0 2px 4px rgba(0,0,0,0.1)}</style></head><body>";
+  html += "<div class='success'><h1>✅ Saved!</h1><p>Device restarting...</p></div>";
+  html += "<script>setTimeout(()=>window.location='/',3000)</script></body></html>";
+  
+  server.send(200, "text/html", html);
+  delay(1000);
+  ESP.restart();
 }
 
 void saveSettings() {
@@ -652,286 +549,208 @@ void saveSettings() {
   preferences.putString("mqtt_user", mqtt_user);
   preferences.putString("mqtt_pass", mqtt_pass);
   preferences.putString("backend_url", backend_url);
-  preferences.putInt("frame_size", frameSize);
-  preferences.putInt("jpeg_quality", jpegQuality);
+  preferences.putInt("frameSize", frameSize);
+  preferences.putInt("jpegQuality", jpegQuality);
   preferences.end();
+  Serial.println("💾 Settings saved to NVS");
 }
 
-//-----------6-----------
-
-//-----------7-----------
-// ===== AP MODE / WEB CONFIGURATION =====
-
-const char* HTML_HEAD = R"(
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset='UTF-8'>
-<meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>ESP32-S3 CAM Setup</title>
-<style>
-body{font-family:Arial,sans-serif;margin:0;padding:20px;background:#1a1a2e}
-.container{max-width:500px;margin:auto;background:#16213e;padding:20px;border-radius:8px;color:#fff}
-h2{color:#e94560;border-bottom:2px solid #e94560;padding-bottom:10px}
-h3{color:#4a90d9;margin-top:20px}
-label{display:block;margin-top:10px;color:#a0a0a0}
-input,select{width:100%;padding:10px;margin-top:5px;border:1px solid #0f3460;border-radius:4px;box-sizing:border-box;background:#1a1a2e;color:#fff}
-button{background:#e94560;color:#fff;border:none;padding:12px 20px;margin-top:20px;border-radius:4px;cursor:pointer;width:100%;font-size:16px}
-button:hover{background:#ff6b6b}
-.info{background:#0f3460;padding:15px;border-radius:4px;margin-bottom:15px}
-.device-id{font-size:24px;color:#4ade80;font-family:monospace;text-align:center;padding:15px;background:#0f3460;border-radius:8px;margin-bottom:15px}
-.preview{width:100%;max-height:250px;object-fit:contain;border-radius:4px;margin-top:10px}
-</style>
-</head>
-<body>
-<div class='container'>
-)";
-
-void handleRoot() {
-  String html = HTML_HEAD;
-  html += "<h2>📷 ESP32-S3 CAM Setup</h2>";
-
-  // DEVICE ID - velké a zřetelné
-  html += "<div class='device-id'>";
-  html += "🆔 " + deviceId;
-  html += "</div>";
-
-  html += "<div class='info'>";
-  html += "<strong>Firmware:</strong> " + String(FIRMWARE_VERSION) + "<br>";
-  html += "<strong>Chip:</strong> ESP32-S3 N16R8<br>";
-  html += "<strong>PSRAM:</strong> " + String(ESP.getPsramSize() / 1024 / 1024) + " MB<br>";
-  html += "<strong>Free Heap:</strong> " + String(ESP.getFreeHeap() / 1024) + " KB";
-  html += "</div>";
-
-  html += "<h3>📷 Live Preview</h3>";
-  html += "<img class='preview' src='/capture' id='preview'>";
-  html += "<button type='button' onclick='document.getElementById(\"preview\").src=\"/capture?\"+Date.now()'>🔄 Refresh</button>";
-
-  html += "<form method='POST' action='/save'>";
-
-  html += "<h3>📶 WiFi</h3>";
-  html += "<label>SSID</label><input name='ssid' value='" + wifi_ssid + "'>";
-  html += "<label>Password</label><input type='password' name='pass' value='" + wifi_pass + "'>";
-
-  html += "<h3>📡 MQTT Broker</h3>";
-  html += "<label>Server</label><input name='mqtt_server' value='" + mqtt_server + "'>";
-  html += "<label>Port</label><input type='number' name='mqtt_port' value='" + String(mqtt_port) + "'>";
-  html += "<label>Username</label><input name='mqtt_user' value='" + mqtt_user + "'>";
-  html += "<label>Password</label><input type='password' name='mqtt_pass' value='" + mqtt_pass + "'>";
-
-  html += "<h3>🖥️ Backend</h3>";
-  html += "<label>Backend URL</label><input name='backend_url' value='" + backend_url + "' placeholder='http://192.168.x.x:3004'>";
-
-  html += "<h3>📐 Camera</h3>";
-  html += "<label>Resolution</label><select name='resolution'>";
-  html += "<option value='3'" + String(frameSize == FRAMESIZE_QVGA ? " selected" : "") + ">QVGA (320x240)</option>";
-  html += "<option value='6'" + String(frameSize == FRAMESIZE_VGA ? " selected" : "") + ">VGA (640x480)</option>";
-  html += "<option value='7'" + String(frameSize == FRAMESIZE_SVGA ? " selected" : "") + ">SVGA (800x600)</option>";
-  html += "<option value='8'" + String(frameSize == FRAMESIZE_XGA ? " selected" : "") + ">XGA (1024x768)</option>";
-  html += "</select>";
-
-  html += "<label>JPEG Quality (0-63, lower=better)</label>";
-  html += "<input type='number' name='quality' value='" + String(jpegQuality) + "' min='0' max='63'>";
-
-  html += "<button type='submit'>💾 Save & Restart</button>";
-  html += "</form></div></body></html>";
-
-  server.send(200, "text/html", html);
-}
-
-void handleSave() {
-  wifi_ssid = server.arg("ssid");
-  wifi_pass = server.arg("pass");
-  mqtt_server = server.arg("mqtt_server");
-  mqtt_port = server.arg("mqtt_port").toInt();
-  mqtt_user = server.arg("mqtt_user");
-  mqtt_pass = server.arg("mqtt_pass");
-  backend_url = server.arg("backend_url");
-  frameSize = server.arg("resolution").toInt();
-  jpegQuality = server.arg("quality").toInt();
-
-  saveSettings();
-
-  String html = HTML_HEAD;
-  html += "<h2>✅ Saved!</h2><p>Device is restarting...</p>";
-  html += "<p>Device ID: <strong>" + deviceId + "</strong></p>";
-  html += "</div></body></html>";
-  server.send(200, "text/html", html);
-
-  delay(1000);
-  ESP.restart();
-}
-
-void handleAPCapture() {
-  camera_fb_t * fb = esp_camera_fb_get();
-  if (!fb) {
-    server.send(500, "text/plain", "Capture failed");
-    return;
-  }
-  server.sendHeader("Content-Type", "image/jpeg");
-  server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
-  esp_camera_fb_return(fb);
-}
-
-void startAPMode() {
-  apMode = true;
-  Serial.println("\n🔧 Starting AP Mode...");
+void loadSettings() {
+  preferences.begin("cam-config", true);
+  wifi_ssid = preferences.getString("wifi_ssid", "");
+  wifi_pass = preferences.getString("wifi_pass", "");
+  mqtt_server = preferences.getString("mqtt_server", "");
+  mqtt_port = preferences.getInt("mqtt_port", 1883);
+  mqtt_user = preferences.getString("mqtt_user", "");
+  mqtt_pass = preferences.getString("mqtt_pass", "");
+  backend_url = preferences.getString("backend_url", "");
+  frameSize = preferences.getInt("frameSize", FRAMESIZE_VGA);
+  jpegQuality = preferences.getInt("jpegQuality", 12);
+  preferences.end();
   
-  WiFi.mode(WIFI_AP);
-  String apName = "ESP32S3-CAM-" + deviceId.substring(3);
-  WiFi.softAP(apName.c_str(), "12345678");
-
-  IPAddress IP = WiFi.softAPIP();
-  Serial.printf("📡 AP: %s (pass: 12345678)\n", apName.c_str());
-  Serial.printf("   IP: %s\n", IP.toString().c_str());
-  Serial.printf("   Device ID: %s\n", deviceId.c_str());
-
-  dnsServer.start(53, "*", IP);
-
-  server.on("/", handleRoot);
-  server.on("/save", HTTP_POST, handleSave);
-  server.on("/capture", handleAPCapture);
-  server.on("/generate_204", handleRoot);
-  server.on("/fwlink", handleRoot);
-  server.onNotFound(handleRoot);
-
-  server.begin();
-  Serial.println("🌐 Web config portal started");
-
-  // AP mode loop
-  while (true) {
-    dnsServer.processNextRequest();
-    server.handleClient();
-    
-    // Blink LED in AP mode
-    static unsigned long lastBlink = 0;
-    if (millis() - lastBlink > 500) {
-      static bool state = false;
-      setLed(state);
-      state = !state;
-      lastBlink = millis();
-    }
+  Serial.println("📖 Settings loaded from NVS");
+  if (wifi_ssid.length() > 0) {
+    Serial.printf("   WiFi: %s\n", wifi_ssid.c_str());
+    Serial.printf("   MQTT: %s:%d\n", mqtt_server.c_str(), mqtt_port);
   }
 }
 
 //-----------7-----------
 
 //-----------8-----------
-// ===== BOOT BUTTON HANDLER =====
-// Podle SolaxCloudBridge:
-// 5-15s = AP Mode
-// >15s = Factory Reset
-//
-// DEBUG: Verbose logging pro diagnostiku
+// ===== MQTT HANDLERS =====
 
-void checkBootButton() {
-  static unsigned long btnPressStart = 0;
-  static bool btnPressed = false;
+void setupMQTT() {
+  mqtt.setServer(mqtt_server.c_str(), mqtt_port);
+  mqtt.setCallback(mqttCallback);
+  mqtt.setBufferSize(512);
+  mqtt.setKeepAlive(60);
+  mqtt.setSocketTimeout(15);
+  connectMQTT();
+}
 
-  int btnState = digitalRead(BOOT_BUTTON_PIN);
-
-  // NO DEBUG SPAM - causes performance issues
-
-  if (btnState == LOW) {  // Pressed (Active LOW)
-    if (!btnPressed) {
-      btnPressed = true;
-      btnPressStart = millis();
-      Serial.println("═══════════════════════════════════════");
-      Serial.println("🔘 BOOT BUTTON PRESSED!");
-      Serial.println("   Hold 5-15s for AP Mode");
-      Serial.println("   Hold >15s for Factory Reset");
-      Serial.println("═══════════════════════════════════════");
-    }
-
-    unsigned long duration = millis() - btnPressStart;
-
-    // Print duration while holding
-    if (duration > 1000 && (duration / 1000) != ((duration - 100) / 1000)) {
-      Serial.printf("⏱️ Button held: %lu seconds\n", duration / 1000);
-    }
-
-    // 15s = Factory Reset (execute immediately while still pressed)
-    if (duration > 15000) {
-      Serial.println("═══════════════════════════════════════");
-      Serial.println("⚠️ 15+ SECONDS → FACTORY RESET!");
-      Serial.println("═══════════════════════════════════════");
-      wipeNVS();  // Will restart
-      return;
-    }
+void connectMQTT() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (mqtt.connected()) return;
+  
+  Serial.print("🔗 Connecting to MQTT... ");
+  
+  String clientId = deviceId + "-" + String(random(0xffff), HEX);
+  
+  bool connected;
+  if (mqtt_user.length() > 0) {
+    connected = mqtt.connect(clientId.c_str(), mqtt_user.c_str(), mqtt_pass.c_str());
+  } else {
+    connected = mqtt.connect(clientId.c_str());
+  }
+  
+  if (connected) {
+    Serial.println("✅ Connected");
     
-    // 5s = Visual feedback for AP mode pending
-    if (duration > 5000) {
-      setLed((millis() / 100) % 2 == 0);  // Fast blink
-      
-      // Print once when crossing 5s threshold
-      static bool printedAPReady = false;
-      if (!printedAPReady) {
-        Serial.println("✨ 5s reached - Release now for AP Mode");
-        printedAPReady = true;
-      }
-    }
-
-  } else { // Released (HIGH)
-    if (btnPressed) {
-      unsigned long duration = millis() - btnPressStart;
-      setLed(false);
-      
-      Serial.printf("🔘 Button RELEASED after %lu ms\n", duration);
-      
-      if (duration > 5000 && duration < 15000) {
-        Serial.println("═══════════════════════════════════════");
-        Serial.println("🔧 5-15s DETECTED → STARTING AP MODE!");
-        Serial.println("═══════════════════════════════════════");
-        startAPMode();  // Never returns (infinite loop)
-      } else if (duration < 5000) {
-        Serial.println("🔘 Short press (<5s), ignoring");
-      }
-      
-      btnPressed = false;
-    }
+    String controlTopic = mqttPrefix + "/control";
+    mqtt.subscribe(controlTopic.c_str());
+    
+    publishStatus();
+  } else {
+    Serial.printf("❌ Failed (state: %d)\n", mqtt.state());
   }
 }
 
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  if (length > sizeof(mqttDecryptBuffer)) return;
+  
+  memcpy(mqttDecryptBuffer, payload, length);
+  xorPayload(mqttDecryptBuffer, length);
+  
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, mqttDecryptBuffer, length);
+  
+  if (error) {
+    Serial.printf("❌ JSON parse error: %s\n", error.c_str());
+    return;
+  }
+  
+  const char* cmd = doc["cmd"];
+  if (!cmd) return;
+  
+  Serial.printf("📬 MQTT: %s\n", cmd);
+  
+  if (strcmp(cmd, "flash") == 0) {
+    bool state = doc["state"] | false;
+    setFlash(state);
+  }
+  else if (strcmp(cmd, "stream") == 0) {
+    streamingEnabled = doc["enabled"] | true;
+    Serial.printf("   Stream: %s\n", streamingEnabled ? "ON" : "OFF");
+  }
+  else if (strcmp(cmd, "quality") == 0) {
+    int q = doc["quality"] | 12;
+    jpegQuality = constrain(q, 0, 63);
+    sensor_t * s = esp_camera_sensor_get();
+    if (s) s->set_quality(s, jpegQuality);
+    Serial.printf("   Quality: %d\n", jpegQuality);
+  }
+  else if (strcmp(cmd, "resolution") == 0) {
+    const char* res = doc["resolution"];
+    if (res) {
+      if (strcmp(res, "VGA") == 0) frameSize = FRAMESIZE_VGA;
+      else if (strcmp(res, "SVGA") == 0) frameSize = FRAMESIZE_SVGA;
+      else if (strcmp(res, "XGA") == 0) frameSize = FRAMESIZE_XGA;
+      else if (strcmp(res, "SXGA") == 0) frameSize = FRAMESIZE_SXGA;
+      
+      sensor_t * s = esp_camera_sensor_get();
+      if (s) s->set_framesize(s, (framesize_t)frameSize);
+      Serial.printf("   Resolution: %s\n", getResolutionName().c_str());
+    }
+  }
+  else if (strcmp(cmd, "restart") == 0) {
+    Serial.println("🔄 Restart requested");
+    ESP.restart();
+  }
+}
+
+void publishStatus() {
+  if (!mqtt.connected()) return;
+  
+  JsonDocument doc;
+  doc["device_id"] = deviceId;
+  doc["version"] = FIRMWARE_VERSION;
+  doc["uptime"] = millis() / 1000;
+  doc["heap"] = ESP.getFreeHeap();
+  doc["psram"] = ESP.getFreePsram();
+  doc["wifi_rssi"] = WiFi.RSSI();
+  doc["resolution"] = getResolutionName();
+  doc["quality"] = jpegQuality;
+  doc["streaming"] = streamingEnabled;
+  doc["active_streams"] = activeStreamCount;
+  doc["ip"] = WiFi.localIP().toString();
+  
+  String statusTopic = mqttPrefix + "/status";
+  String payload;
+  serializeJson(doc, payload);
+  
+  publishEncrypted(statusTopic, payload);
+}
 
 //-----------8-----------
 
 //-----------9-----------
-// ===== BACKEND REGISTRATION =====
+// ===== STREAM SERVER SETUP =====
 
+void setupStreamServer() {
+  streamServer.on("/stream", HTTP_GET, handleStreamRequest);
+  streamServer.on("/capture", HTTP_GET, handleCapture);
+  streamServer.begin();
+  Serial.println("📹 Stream server started on port 81");
+}
+
+// ===== BACKEND REGISTRATION =====
 void registerWithBackend() {
   if (backend_url.length() == 0) return;
-
-  HTTPClient http;
-  String url = backend_url + "/api/camera/register";
+  if (WiFi.status() != WL_CONNECTED) return;
   
-  http.begin(url);
-  http.setTimeout(2000);  // 2s max - non-blocking-ish
+  HTTPClient http;
+  http.setTimeout(5000);
+  
+  String url = backend_url + "/api/devices/register";
+  
+  if (!http.begin(url)) {
+    Serial.println("⚠️ Backend registration: URL failed");
+    return;
+  }
+  
   http.addHeader("Content-Type", "application/json");
   
   JsonDocument doc;
-  doc["deviceId"] = deviceId;
+  doc["device_id"] = deviceId;
+  doc["device_type"] = "camera";
+  doc["version"] = FIRMWARE_VERSION;
   doc["ip"] = WiFi.localIP().toString();
-  doc["port"] = 81;
-  doc["resolution"] = getResolutionName();
-  doc["streaming"] = streamingEnabled;
+  doc["stream_url"] = "http://" + WiFi.localIP().toString() + ":81/stream";
+  doc["snapshot_url"] = "http://" + WiFi.localIP().toString() + ":81/capture";
   doc["chip"] = "ESP32-S3";
   
   String body;
   serializeJson(doc, body);
   
-  http.POST(body);  // Fire and forget
+  int httpCode = http.POST(body);
+  
+  if (httpCode > 0) {
+    Serial.printf("📡 Backend registered (HTTP %d)\n", httpCode);
+  } else {
+    Serial.printf("⚠️ Backend registration failed: %s\n", http.errorToString(httpCode).c_str());
+  }
+  
   http.end();
 }
 
 // ===== WIFI CONNECTION =====
-
 bool connectWiFi() {
   if (wifi_ssid.length() == 0) return false;
 
   Serial.printf("📶 Connecting to: %s\n", wifi_ssid.c_str());
   
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false); // DISABLE POWER SAVE - Critical for smooth streaming!
   WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
 
   int attempts = 0;
@@ -947,7 +766,6 @@ bool connectWiFi() {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("✅ Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-    WiFi.setSleep(false); // Ensure it stays off
     return true;
   }
   Serial.println("❌ WiFi failed");
@@ -964,10 +782,10 @@ void setup() {
   delay(100);
   
   Serial.println("\n\n╔════════════════════════════════════════╗");
-  Serial.println("║   📷 ESP32-S3 CAM ZONIO v1.1          ║");
+  Serial.println("║   📷 ESP32-S3 CAM ZONIO v1.2          ║");
   Serial.println("╚════════════════════════════════════════╝");
   Serial.printf("   Firmware: %s\n", FIRMWARE_VERSION);
-  Serial.printf("   PSRAM: %d MB\n", ESP.getPsramSize() / 1024 / 1024);
+  Serial.printf("   PSRAM: %lu MB\n", ESP.getPsramSize() / 1024 / 1024);
   
   // Init pins
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
@@ -980,47 +798,41 @@ void setup() {
   setLed(false);
   #endif
   
-  // Get device ID
   deviceId = getChipId();
   mqttPrefix = "zonio/cam/" + deviceId;
   Serial.printf("   Device ID: %s\n", deviceId.c_str());
   
-  // Init camera
   if (!initCamera()) {
     Serial.println("❌ Camera failed!");
   }
   
-  // Load settings
   loadSettings();
-  
-  // Init static PSRAM buffer for XOR encryption
   initXorBuffer();
   
-  // Check for immediate AP mode on boot (button held during startup)
+  // Create mutex for stream task coordination
+  streamMutex = xSemaphoreCreateMutex();
+  
   if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
     Serial.println("🔧 BOOT button held on startup → AP Mode");
-    delay(1000); // Debounce
+    delay(1000);
     if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
       startAPMode();
       return;
     }
   }
   
-  // Check if WiFi configured
   if (wifi_ssid.length() == 0 || mqtt_server.length() == 0) {
     Serial.println("⚠️ Not configured → AP Mode");
     startAPMode();
     return;
   }
   
-  // Connect WiFi
   if (!connectWiFi()) {
     Serial.println("⚠️ WiFi failed → AP Mode");
     startAPMode();
     return;
   }
   
-  // Setup services
   setupMQTT();
   setupStreamServer();
   registerWithBackend();
@@ -1030,16 +842,53 @@ void setup() {
   Serial.println("\n✅ ESP32-S3 CAM READY");
   Serial.printf("   Stream: http://%s:81/stream\n", WiFi.localIP().toString().c_str());
   Serial.printf("   Snapshot: http://%s:81/capture\n", WiFi.localIP().toString().c_str());
+  Serial.printf("   Loop running on Core: %d\n", xPortGetCoreID());
   Serial.println("\n💡 Tip: Hold BOOT 5-15s for AP mode, >15s for factory reset");
 }
 
 void loop() {
+  #if DEBUG_TIMING
+  static unsigned long maxMqttLoop = 0;
+  static unsigned long totalMqttLoop = 0;
+  static unsigned long timingCycles = 0;
+  #endif
+  
   checkBootButton();
+  
+  // Handle config portal in AP mode
+  if (apMode) {
+    dnsServer.processNextRequest();
+    server.handleClient();
+    processNonBlockingBlink();
+    yield();
+    return;
+  }
+  
+  // Handle stream server requests (just accepts connections, task does the work)
   streamServer.handleClient();
+  
   processNonBlockingBlink();
-  yield();  // Feed WDT
+  yield();
+  
+  #if DEBUG_TIMING
+  timingCycles++;
+  #endif
+  
+  // WiFi watchdog
+  static unsigned long lastWiFiCheck = 0;
+  if (millis() - lastWiFiCheck > 60000) {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("📶 WiFi lost, reconnecting...");
+      WiFi.reconnect();
+    }
+    lastWiFiCheck = millis();
+  }
   
   // MQTT handling
+  #if DEBUG_TIMING
+  unsigned long t4 = micros();
+  #endif
+  
   if (!mqtt.connected()) {
     static unsigned long lastReconnect = 0;
     if (millis() - lastReconnect > 5000) {
@@ -1050,18 +899,83 @@ void loop() {
     mqtt.loop();
   }
   
-  // Heartbeat - burst shot
+  #if DEBUG_TIMING
+  unsigned long mqttTime = micros() - t4;
+  if (mqttTime > maxMqttLoop) maxMqttLoop = mqttTime;
+  totalMqttLoop += mqttTime;
+  #endif
+  
+  // Heartbeat
   if (millis() - lastHeartbeat > 30000) {
     publishStatus();
     lastHeartbeat = millis();
   }
   
-  // Backend registration - 5 min interval (was 1 min)
+  // Backend registration
   if (millis() - lastRegistration > 300000) {
     registerWithBackend();
     lastRegistration = millis();
   }
-  // NO DELAY - yield() handles WDT
+  
+  // ===== DIAGNOSTICS =====
+  #if DEBUG_DIAGNOSTICS
+  static unsigned long lastDiag = 0;
+  static uint32_t minHeap = 0xFFFFFFFF;
+  static uint32_t minPsram = 0xFFFFFFFF;
+  static uint32_t loopCounter = 0;
+  static unsigned long lastLoopCount = 0;
+  loopCounter++;
+  
+  uint32_t currentHeap = ESP.getFreeHeap();
+  uint32_t currentPsram = ESP.getFreePsram();
+  if (currentHeap < minHeap) minHeap = currentHeap;
+  if (currentPsram < minPsram) minPsram = currentPsram;
+  
+  if (millis() - lastDiag > DIAG_INTERVAL_MS) {
+    unsigned long uptime = millis() / 1000;
+    uint32_t loopsPerSec = (loopCounter - lastLoopCount) / (DIAG_INTERVAL_MS / 1000);
+    
+    Serial.println("\n╔══════════════════════════════════════════════════════╗");
+    Serial.printf("║ 🔍 DIAG @ %lu s uptime                              ║\n", uptime);
+    Serial.println("╠══════════════════════════════════════════════════════╣");
+    Serial.printf("║ HEAP:     %3lu KB free (min: %3lu KB)                 ║\n", 
+        (unsigned long)(currentHeap / 1024), (unsigned long)(minHeap / 1024));
+    Serial.printf("║ PSRAM:   %4lu KB free (min: %4lu KB)                  ║\n", 
+        (unsigned long)(currentPsram / 1024), (unsigned long)(minPsram / 1024));
+    Serial.println("╠══════════════════════════════════════════════════════╣");
+    Serial.printf("║ WiFi:  RSSI=%d dBm, Status=%d                        ║\n", 
+        WiFi.RSSI(), WiFi.status());
+    Serial.printf("║ MQTT:  connected=%d, state=%d                        ║\n", 
+        mqtt.connected(), mqtt.state());
+    Serial.printf("║ Stream tasks: %d active                              ║\n", 
+        activeStreamCount);
+    Serial.printf("║ Loop:  %lu iter/s (Core %d)                          ║\n", 
+        (unsigned long)loopsPerSec, xPortGetCoreID());
+    
+    #if DEBUG_TIMING
+    Serial.println("╠══════════════════════════════════════════════════════╣");
+    Serial.println("║ ⏱️  TIMING (microseconds):                           ║");
+    Serial.printf("║   mqttLoop:      avg=%lu, max=%lu us                 ║\n",
+        timingCycles > 0 ? totalMqttLoop / timingCycles : 0, maxMqttLoop);
+    
+    maxMqttLoop = 0;
+    totalMqttLoop = 0;
+    timingCycles = 0;
+    #endif
+    
+    Serial.println("╚══════════════════════════════════════════════════════╝");
+    
+    if (currentHeap < 50000) {
+      Serial.println("⚠️ WARNING: HEAP CRITICALLY LOW!");
+    }
+    if (loopsPerSec < 1000 && activeStreamCount == 0) {
+      Serial.println("⚠️ WARNING: LOOP RATE SLOW WITHOUT ACTIVE STREAMS!");
+    }
+    
+    lastDiag = millis();
+    lastLoopCount = loopCounter;
+  }
+  #endif
 }
 
 //-----------10-----------
